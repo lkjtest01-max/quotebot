@@ -1,0 +1,29 @@
+{
+  "name": "crypto-quote-bot",
+  "version": "1.0.0",
+  "description": "超级好用的加密货币智能报价机器人 - Telegram Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "crypto",
+    "cryptocurrency",
+    "price",
+    "quote"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "telegraf": "^4.15.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
+
