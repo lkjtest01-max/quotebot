@@ -684,15 +684,33 @@ bot.catch((err, ctx) => {
 });
 
 // 启动机器人
-console.log('🚀 机器人启动中...');
-bot.launch()
-  .then(() => {
-    console.log('✅ 机器人已成功启动！');
-  })
-  .catch((err) => {
-    console.error('❌ 启动失败:', err);
-    process.exit(1);
-  });
+// ===== 下面这 15 行是专门解决 Render 掉线问题的，必加！=====
+const express = require('express')
+const app = express()
+
+// Render 要求的端口，必须监听这个，否则几分钟就被杀掉
+const PORT = process.env.PORT || 3000
+
+// 加一个健康检查页面，Render 会定时访问这个路径保持服务活跃
+app.get('/', (req, res) => {
+  res.send('QuoteBot is running 24/7! 🚀')
+})
+
+// 启动一个极小的 web 服务器（必须！）
+app.listen(PORT, () => {
+  console.log(`Web server running on port ${PORT}`)
+})
+
+// 启动 Telegram bot（保持你原来的参数）
+bot.launch({
+  dropPendingUpdates: true
+}).then(() => {
+  console.log('机器人已经成功启动！')
+}).catch(err => {
+  console.error('启动失败：', err)
+  process.exit(1)
+})
+// =========================================================
 
 // 优雅关闭
 process.once('SIGINT', () => {
