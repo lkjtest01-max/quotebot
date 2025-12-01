@@ -394,6 +394,7 @@ async function fetchFromDexScreener(input, detectedChain) {
       dexScreenerUrl: `https://dexscreener.com/${bestPair.chainId}/${bestPair.pairAddress}`,
       birdeyeUrl: chain === 'Solana' ? `https://birdeye.so/token/${token.address}` : `https://birdeye.so/token/${token.address}?chain=${bestPair.chainId}`,
       aveUrl: `https://ave.ai/token/${token.address}?chain=${bestPair.chainId}`,
+    chartToken: token.address || null,
       source: 'DexScreener'
     };
     
@@ -469,6 +470,7 @@ async function fetchFromBirdeye(input, detectedChain) {
           dexScreenerUrl: chain === 'Solana' ? `https://dexscreener.com/solana/${cleanInput}` : `https://dexscreener.com/${chain.toLowerCase()}/${cleanInput}`,
           birdeyeUrl: `https://birdeye.so/token/${cleanInput}`,
           aveUrl: `https://ave.ai/token/${cleanInput}?chain=${chain.toLowerCase()}`,
+          chartToken: cleanInput,
           source: 'Birdeye'
         };
         
@@ -482,6 +484,221 @@ async function fetchFromBirdeye(input, detectedChain) {
     console.error('Birdeye API error:', error.message);
     return null;
   }
+}
+
+// 使用 DexScreener 搜索接口查找交易对（用于图表）
+async function searchPairsOnDexScreener(query) {
+  const cleanQuery = query.trim();
+  try {
+    const response = await requestWithRetry(
+      async () => {
+        return await axios.get(
+          `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(
+            cleanQuery
+          )}`,
+          {
+            timeout: 10000,
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+          }
+        );
+      },
+      2,
+      1500
+    );
+
+    return Array.isArray(response.data?.pairs) ? response.data.pairs : [];
+  } catch (error) {
+    console.error('DexScreener search for pairs failed:', error.message);
+    return [];
+  }
+}
+
+// 从搜索结果中挑出最适合画图的交易对（流动性最高）
+async function findBestPairForChart(input, detectedChain) {
+  const pairs = await searchPairsOnDexScreener(input);
+  if (!pairs.length) return null;
+
+  // 优先匹配同链（如果检测到链的话）
+  const filtered = detectedChain
+    ? pairs.filter((p) => (p.chainId || '').toLowerCase() === detectedChain.toLowerCase())
+    : pairs;
+
+  const candidateList = filtered.length ? filtered : pairs;
+
+  const bestPair =
+    candidateList
+      .filter((pair) => pair.liquidity && pair.liquidity.usd)
+      .sort(
+        (a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+      )[0] || candidateList[0];
+
+  if (!bestPair) return null;
+
+  return {
+    chainId: bestPair.chainId,
+    pairAddress: bestPair.pairAddress
+  };
+}
+
+// 为 BTC / ETH 等主流币使用 CoinGecko + QuickChart 生成 30 分钟价格折线图（fallback）
+async function generateMainCoinFallbackChart(cleanInput, tokenData) {
+  const upper = cleanInput.toUpperCase();
+  const coinId = MAIN_COINS[upper];
+  if (!coinId) return null;
+
+  try {
+    const marketChartResp = await requestWithRetry(
+      async () => {
+        return await axios.get(
+          `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=1&interval=minute`,
+          {
+            timeout: 10000,
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+          }
+        );
+      },
+      2,
+      1500
+    );
+
+    const prices = Array.isArray(marketChartResp.data?.prices)
+      ? marketChartResp.data.prices
+      : [];
+    if (!prices.length) return null;
+
+    const now = Date.now();
+    const THIRTY_MIN_MS = 30 * 60 * 1000;
+    const recent = prices.filter(([ts]) => now - ts <= THIRTY_MIN_MS);
+    const series = recent.length ? recent : prices.slice(-60); // 保底
+
+    const labels = series.map(([ts]) => new Date(ts).toISOString().slice(11, 16)); // HH:MM
+    const data = series.map(([, price]) => Number(price.toFixed(6)));
+
+    const symbol = tokenData?.symbol || upper;
+
+    const chartConfig = {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: `${symbol} Price (30m)`,
+            data,
+            borderColor: '#4bc0c0',
+            backgroundColor: 'rgba(75,192,192,0.15)',
+            fill: true,
+            tension: 0.25,
+            borderWidth: 2,
+            pointRadius: 0
+          }
+        ]
+      },
+      options: {
+        plugins: {
+          legend: { display: false },
+          title: {
+            display: true,
+            text: `${symbol} - 30m Price`,
+            color: '#ffffff',
+            font: { size: 18 }
+          }
+        },
+        scales: {
+          x: {
+            display: true,
+            grid: { color: 'rgba(255,255,255,0.1)' },
+            ticks: { color: '#cccccc', maxTicksLimit: 6 }
+          },
+          y: {
+            display: true,
+            grid: { color: 'rgba(255,255,255,0.1)' },
+            ticks: {
+              color: '#cccccc',
+              callback: (v) => `$${v}`
+            }
+          }
+        }
+      }
+    };
+
+    const quickChartUrl = `https://quickchart.io/chart?width=1200&height=600&backgroundColor=black&c=${encodeURIComponent(
+      JSON.stringify(chartConfig)
+    )}`;
+
+    const imgResp = await requestWithRetry(
+      async () => {
+        return await axios.get(quickChartUrl, {
+          responseType: 'arraybuffer',
+          timeout: 15000
+        });
+      },
+      2,
+      2000
+    );
+
+    return Buffer.from(imgResp.data);
+  } catch (error) {
+    console.error('Generate main coin fallback chart error:', error.message);
+    return null;
+  }
+}
+
+// 生成 30 分钟 K 线图图片：
+// 1）优先 DexScreener 官方 pairs 截图 PNG
+// 2）如果没有合适的 pair 且是主流币（BTC/ETH 等），用 CoinGecko + QuickChart fallback
+async function generateTokenChartImage(tokenData, originalInput, cleanInputForMain) {
+  const cleanInput = (cleanInputForMain || originalInput || '').trim().toUpperCase();
+
+  // 先看有没有合适的 DexScreener pair
+  try {
+    const detectedChain = detectChain(originalInput || cleanInput);
+    const bestPair = await findBestPairForChart(originalInput || cleanInput, detectedChain);
+
+    if (bestPair && bestPair.chainId && bestPair.pairAddress) {
+      const width = 1200;
+      const height = 600;
+      const chartUrl = `https://api.dexscreener.com/chart/v1/pairs/${bestPair.chainId}/${bestPair.pairAddress}?range=30m&width=${width}&height=${height}&theme=dark`;
+
+      const response = await requestWithRetry(
+        async () => {
+          return await axios.get(chartUrl, {
+            responseType: 'arraybuffer',
+            timeout: 15000,
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+          });
+        },
+        2,
+        2000
+      );
+
+      return Buffer.from(response.data);
+    }
+  } catch (error) {
+    console.error('DexScreener pair chart fetch error:', error.message);
+    // 继续尝试主流币 fallback
+  }
+
+  // 如果 DexScreener pairs 没有图，且是主流币，则用 CoinGecko + QuickChart fallback
+  try {
+    const fallbackBuffer = await generateMainCoinFallbackChart(cleanInput, tokenData);
+    if (fallbackBuffer) {
+      return fallbackBuffer;
+    }
+  } catch (e) {
+    console.error('Main coin fallback chart overall error:', e.message);
+  }
+
+  // 都失败则返回 null，不发图
+  return null;
 }
 
 // 处理代币查询（主逻辑）
@@ -606,7 +823,24 @@ ${changeEmoji} 24h涨幅: <b>${changeColor} ${priceChange24h >= 0 ? '+' : ''}${p
       [Markup.button.url('🚀 Ave.ai', aveUrl)]
     ]);
     
+    // 先发文字报价卡片
     await ctx.replyWithHTML(message, buttons);
+
+    // 再尝试发送 30 分钟 K 线图截图（失败不影响主流程）
+    try {
+      const chartBuffer = await generateTokenChartImage(tokenData, input);
+      if (chartBuffer) {
+        await ctx.replyWithPhoto(
+          { source: chartBuffer },
+          {
+            caption: `🕒 30 分钟 K 线图（含最新一根K线）\n${name} (${symbol})`
+          }
+        );
+      }
+    } catch (chartError) {
+      console.error('Send chart image error:', chartError.message);
+      // 图表失败不提示用户，保证体验稳定
+    }
   } catch (error) {
     console.error('Error handling token query:', error);
     ctx.reply('❌ 获取代币信息时出错，请稍后再试。');
